@@ -39,37 +39,49 @@ class CrossEncoder(nn.Module):
         self.encoder = AutoModel.from_pretrained(config.model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
-        # Simple scoring head
+        # More sophisticated scoring head
         hidden_size = self.encoder.config.hidden_size
         self.score_head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.LayerNorm(hidden_size // 2),
             nn.Dropout(0.1),
-            nn.Linear(hidden_size, 1)
+            nn.Linear(hidden_size // 2, 1)
         )
 
     def forward(self, questions: List[str], documents: List[str]) -> torch.Tensor:
+        # Debug tokenization
+        for i in range(min(2, len(questions))):  # Print first 2 examples
+            print(f"\nExample {i}:")
+            print(f"Question: {questions[i]}")
+            print(f"Document: {documents[i]}")
+            tokens = self.tokenizer.tokenize(questions[i] + " " + documents[i])
+            print(f"Tokens: {tokens[:50]}...")  # Print first 50 tokens
+        
         # Prepare input pairs
-        pairs = [
-            (q, d) for q, d in zip(questions, documents)
-        ]
-
-        # Tokenize with special tokens and attention masks
         inputs = self.tokenizer(
-            pairs,
+            questions,
+            documents,
             padding=True,
             truncation=True,
             max_length=self.config.max_length,
-            return_tensors="pt"
-        ).to(self.device)
-
+            return_tensors='pt'
+        )
+        
+        # Move inputs to the same device as model
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
         # Get contextualized embeddings
         outputs = self.encoder(**inputs)
-
+        
         # Use [CLS] token embedding for scoring
         cls_embedding = outputs.last_hidden_state[:, 0]
-
+        
         # Generate similarity score
         scores = self.score_head(cls_embedding)
-
+        
         return scores
 
     @property
@@ -127,24 +139,62 @@ class CrossEncoderTrainer:
         patience_counter = 0
         global_step = 0
 
+        # Add debugging for first batch
+        debug_batch = next(iter(train_dataloader))
+        print("\nDEBUG - First batch:")
+        print(f"Labels distribution: {debug_batch['label'].tolist()}")
+        print(f"Sample question: {debug_batch['question'][0]}")
+        print(f"Sample document: {debug_batch['document'][0]}")
+        
+        # Verify model predictions
+        self.model.eval()  # Temporary eval mode
+        with torch.no_grad():
+            debug_scores = self.model(debug_batch['question'], debug_batch['document']).squeeze()
+            print(f"Initial predictions: {torch.sigmoid(debug_scores[:5])}")
+            print(f"Actual labels: {debug_batch['label'][:5]}")
+        self.model.train()
+
         for epoch in range(self.config.num_epochs):
             self.model.train()
             total_loss = 0
             epoch_steps = 0
+            all_epoch_losses = []  # Track all losses in epoch
 
-            progress_bar = tqdm(train_dataloader, desc=f'Epoch {
-                                epoch + 1}/{self.config.num_epochs}')
+            progress_bar = tqdm(train_dataloader, desc=f'Epoch {epoch + 1}/{self.config.num_epochs}')
 
             for batch in progress_bar:
                 questions = batch['question']
                 documents = batch['document']
                 labels = batch['label'].float().to(self.device)
 
-                scores = self.model(questions, documents)
-                loss = criterion(scores.squeeze(), labels)
+                # Forward pass
+                scores = self.model(questions, documents).squeeze()
+                
+                # Debug predictions occasionally
+                if epoch_steps % 100 == 0:
+                    with torch.no_grad():
+                        probs = torch.sigmoid(scores.detach())
+                        print(f"\nStep {epoch_steps} predictions vs labels:")
+                        print(f"Predictions: {probs[:5]}")
+                        print(f"Labels: {labels[:5]}")
 
+                # Compute loss
+                loss = criterion(scores, labels)
+                
+                # Store loss
+                all_epoch_losses.append(loss.item())
+
+                # Backward pass and optimization
                 optimizer.zero_grad()
                 loss.backward()
+                
+                # Debug gradients
+                if epoch_steps % 100 == 0:
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            print(f"{name} gradient norm: {grad_norm}")
+
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
@@ -153,50 +203,55 @@ class CrossEncoderTrainer:
                 epoch_steps += 1
                 global_step += 1
 
-                # Update progress bar
+                # Update progress bar with more stats
                 progress_bar.set_postfix({
                     'loss': loss.item(),
                     'avg_loss': total_loss / epoch_steps,
-                    'step': global_step
+                    'step': global_step,
+                    'lr': scheduler.get_last_lr()[0]
                 })
 
-                # Evaluate at regular intervals
-                if global_step % eval_steps == 0 and val_dataset:
-                    avg_loss = total_loss / epoch_steps
-                    print(f'\nStep {global_step}, Average Loss: {
-                          avg_loss:.4f}')
+            # End of epoch statistics
+            epoch_losses = np.array(all_epoch_losses)
+            print(f"\nEpoch {epoch + 1} Statistics:")
+            print(f"Mean Loss: {epoch_losses.mean():.4f}")
+            print(f"Std Loss: {epoch_losses.std():.4f}")
+            print(f"Min Loss: {epoch_losses.min():.4f}")
+            print(f"Max Loss: {epoch_losses.max():.4f}")
 
-                    val_metrics = self.evaluate(val_dataset)
-                    print(f"Validation metrics: {val_metrics}")
-                    current_val_score = val_metrics['auc_roc']
+            # Evaluate at regular intervals
+            if global_step % eval_steps == 0 and val_dataset:
+                avg_loss = total_loss / epoch_steps
+                print(f'\nStep {global_step}, Average Loss: {
+                      avg_loss:.4f}')
 
-                    # Check if the model has improved
-                    if current_val_score > best_val_score + min_delta:
-                        print(f"Validation score improved from {
-                              best_val_score:.4f} to {current_val_score:.4f}")
-                        best_val_score = current_val_score
-                        best_model_state = self.model.state_dict().copy()
-                        patience_counter = 0
-                        self.save_model('best_cross_encoder.pt')
-                    else:
-                        patience_counter += 1
-                        print(f"Validation score did not improve. Patience: {
-                              patience_counter}/{patience}")
+                val_metrics = self.evaluate(val_dataset)
+                print(f"Validation metrics: {val_metrics}")
+                current_val_score = val_metrics['auc_roc']
 
-                    # Early stopping check
-                    if patience_counter >= patience:
-                        print(f"Early stopping triggered at step {
-                              global_step}")
-                        # Restore best model
-                        self.model.load_state_dict(best_model_state)
-                        return
+                # Check if the model has improved
+                if current_val_score > best_val_score + min_delta:
+                    print(f"Validation score improved from {
+                          best_val_score:.4f} to {current_val_score:.4f}")
+                    best_val_score = current_val_score
+                    best_model_state = self.model.state_dict().copy()
+                    patience_counter = 0
+                    self.save_model('best_cross_encoder.pt')
+                else:
+                    patience_counter += 1
+                    print(f"Validation score did not improve. Patience: {
+                          patience_counter}/{patience}")
 
-                    # Switch back to training mode
-                    self.model.train()
+                # Early stopping check
+                if patience_counter >= patience:
+                    print(f"Early stopping triggered at step {
+                          global_step}")
+                    # Restore best model
+                    self.model.load_state_dict(best_model_state)
+                    return
 
-            # End of epoch logging
-            avg_loss = total_loss / len(train_dataloader)
-            print(f'Epoch {epoch + 1}, Average Loss: {avg_loss:.4f}')
+                # Switch back to training mode
+                self.model.train()
 
         # If we completed all epochs, ensure we're using the best model
         if best_model_state is not None:
