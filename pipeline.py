@@ -1,26 +1,25 @@
-from .dual_encoder import DualEncoder, DualEncoderConfig
-from .cross_encoder import CrossEncoder, CrossEncoderConfig
-from typing import Union, List, Tuple, Dict
-import torch
+from dual_encoder import BiEncoder, BiEncoderConfig
+from cross_encoder import CrossEncoderWrapper
 import faiss
 import numpy as np
 import pandas as pd
+import torch
+from typing import List, Dict, Union
 from tqdm import tqdm
 
-
 class RetrievalPipeline:
-    def __init__(self,
-                 dual_encoder_path: str,
+    def __init__(self, 
+                 bi_encoder_path: str,
                  cross_encoder_path: str,
                  faiss_index_path: str,
-                 embeddings_path: str,
+                 #embeddings_path: str,
                  corpus_df_path: str,
-                 top_k: int = 100,
+                 top_k: int = 50,
                  rerank_k: int = 10):
         """
         Initialize retrieval pipeline
         Args:
-            dual_encoder_path: Path to dual encoder checkpoint
+            bi_encoder_path: Path to bi encoder checkpoint
             cross_encoder_path: Path to cross encoder checkpoint
             faiss_index_path: Path to saved FAISS index
             embeddings_path: Path to saved document embeddings
@@ -29,41 +28,38 @@ class RetrievalPipeline:
             rerank_k: Number of final results after reranking
         """
         # Load models
-        self.dual_encoder = DualEncoder(DualEncoderConfig())
-        self.cross_encoder = CrossEncoder(CrossEncoderConfig())
-        self.load_models(dual_encoder_path, cross_encoder_path)
-
+        self.Bi_encoder = BiEncoder(BiEncoderConfig())
+        self.cross_encoder = CrossEncoderWrapper()
+        self.load_models(bi_encoder_path, cross_encoder_path)
+        
         # Load FAISS index and embeddings
         self.index = faiss.read_index(faiss_index_path)
-        self.document_embeddings = np.load(embeddings_path)
-
+        #self.document_embeddings = np.load(embeddings_path)
+        
         # Load corpus for retrieving text
         self.corpus_df = pd.read_csv(corpus_df_path)
-
+        
         # Configuration
         self.top_k = top_k
         self.rerank_k = rerank_k
-
+        
         # Move models to GPU if available
-        self.device = torch.device(
-            'cuda' if torch.cuda.is_available() else 'cpu')
-        self.dual_encoder.to(self.device)
-        self.cross_encoder.to(self.device)
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.bi_encoder.to(self.device)
+        #self.cross_encoder.model.to(torch.device("cuda"))
 
-    def load_models(self, dual_encoder_path: str, cross_encoder_path: str):
-        cross_encoder_checkpoint = torch.load(cross_encoder_path)
-        self.cross_encoder.model.load_state_dict(
-            cross_encoder_checkpoint['model_state_dict'])
-        self.cross_encoder.config = cross_encoder_checkpoint['config']
+    def load_models(self, bi_encoder_path: str, cross_encoder_path: str):
+        bi_encoder_checkpoint = torch.load(bi_encoder_path)
+        self.bi_encoder.document_encoder.load_state_dict(
+        bi_encoder_checkpoint['document_encoder'])
+        self.bi_encoder.question_encoder.load_state_dict(
+        bi_encoder_checkpoint['question_encoder'])
+        self.bi_encoder.config = bi_encoder_checkpoint['config']
+        
+        self.cross_encoder.load_model(cross_encoder_path)
 
-        dual_encoder_checkpoint = torch.load(dual_encoder_path)
-        self.dual_encoder.document_encoder.load_state_dict(
-            dual_encoder_checkpoint['document_encoder'])
-        self.dual_encoder.question_encoder.load_state_dict(
-            dual_encoder_checkpoint['question_encoder'])
-        self.dual_encoder.config = dual_encoder_checkpoint['config']
 
-    def retrieve(self, query: str) -> List[Dict[str, Union[str, float, int]]]:
+    def retrieve(self, query: str, rerank: bool = True) -> List[Dict[str, Union[str, float, int]]]:
         """
         Retrieve and rerank documents for a query
         Args:
@@ -75,14 +71,14 @@ class RetrievalPipeline:
         torch.cuda.empty_cache()
 
         # Stage 1: Bi-encoder retrieval
-        with torch.cuda.amp.autocast():
-            query_embedding = self.dual_encoder.encode_question([query])
+        query_embedding = self.bi_encoder.encode_question([query])
+        
         query_embedding = query_embedding.cpu().numpy()
         faiss.normalize_L2(query_embedding)
-
+        
         # Search FAISS index
         scores, doc_indices = self.index.search(query_embedding, self.top_k)
-
+        
         # Get candidate documents
         candidates = []
         for score, doc_idx in zip(scores[0], doc_indices[0]):
@@ -91,34 +87,40 @@ class RetrievalPipeline:
                 'cid': self.corpus_df.iloc[doc_idx]['cid'],
                 'bi_encoder_score': float(score)
             })
+        if rerank:
+            # Stage 2: Cross-encoder reranking
+            candidate_texts = [c['text'] for c in candidates]
+            #self.bi_encoder.to(torch.device("cuda"))
+            batch_size = 16  # Adjust this based on your GPU memory capacity
+            cross_encoder_scores = []
 
-        # Stage 2: Cross-encoder reranking with batching
-        candidate_texts = [c['text'] for c in candidates]
-        batch_size = 8  # Adjust this based on your GPU memory capacity
-        cross_encoder_scores = []
+            for i in range(0, len(candidate_texts), batch_size):
+                batch_texts = candidate_texts[i:i + batch_size]
+                batch_scores = self.cross_encoder.predict(
+                        [query] * len(batch_texts),
+                        batch_texts,
+                        show_progress_bar=False
+                    )
+                cross_encoder_scores.extend(batch_scores)
+            #self.cross_encoder.to(torch.device("cpu"))
+            #Add cross-encoder scores
+            for idx, score in enumerate(cross_encoder_scores):
+                candidates[idx]['cross_encoder_score'] = float(score)
+                
+            candidates.sort(key=lambda x: x['cross_encoder_score'], reverse=True)
+            results = candidates[:self.rerank_k]
+        
+            return results
 
-        for i in range(0, len(candidate_texts), batch_size):
-            batch_texts = candidate_texts[i:i + batch_size]
-            with torch.cuda.amp.autocast():
-                batch_scores = self.cross_encoder(
-                    [query] * len(batch_texts),
-                    batch_texts
-                ).squeeze()
-            cross_encoder_scores.extend(batch_scores.detach().cpu().numpy())
+        else:
+            candidates.sort(key=lambda x: x['bi_encoder_score'], reverse=True)
+            results = candidates[:self.rerank_k]
 
-        # Add cross-encoder scores
-        for idx, score in enumerate(cross_encoder_scores):
-            candidates[idx]['cross_encoder_score'] = float(score)
+            return results
 
-        # Sort by cross-encoder score and get top-k
-        candidates.sort(key=lambda x: x['cross_encoder_score'], reverse=True)
-        results = candidates[:self.rerank_k]
-
-        return results
-
-    def batch_retrieve(self,
-                       queries: List[str],
-                       batch_size: int = 32) -> List[List[Dict[str, Union[str, float, int]]]]:
+    def batch_retrieve(self, 
+                      queries: List[str],
+                      batch_size: int = 32) -> List[List[Dict[str, Union[str, float, int]]]]:
         """
         Batch retrieval for multiple queries
         """
@@ -128,9 +130,9 @@ class RetrievalPipeline:
             batch_results = [self.retrieve(q) for q in batch]
             all_results.extend(batch_results)
         return all_results
-
-
-def evaluate_retrieval(pipeline, test_df, top_k=10):
+    
+    
+def evaluate_retrieval(pipeline, test_df, top_k=10, re_ranking=True):
     """
     Evaluate the retrieval pipeline on a test set using MAP, MRR, NDCG, and Recall@k.
     
@@ -144,7 +146,7 @@ def evaluate_retrieval(pipeline, test_df, top_k=10):
     """
     def parse_cid_string(cid_str):
         """Parse a space-separated string of CIDs into a set of integers."""
-        return set(map(int, cid_str.strip('[]').split(',')))
+        return set(map(int, cid_str.strip('[]').split()))
 
     true_cids = test_df['cid'].apply(parse_cid_string)
     questions = test_df['question'].tolist()
@@ -156,7 +158,7 @@ def evaluate_retrieval(pipeline, test_df, top_k=10):
     
     for question, true_cid_set in tqdm(zip(questions, true_cids), total=len(questions), desc="Evaluating"):
         # Retrieve documents
-        results = pipeline.retrieve(question)
+        results = pipeline.retrieve(question, re_ranking)
         
         # Get retrieved cids
         retrieved_cids = [result['cid'] for result in results[:top_k]]
