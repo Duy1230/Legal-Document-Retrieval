@@ -217,7 +217,7 @@ def evaluate_retrieval(pipeline, test_df, top_k=10, re_ranking=True):
     }
 
 
-bi_encoder_path = "/kaggle/input/bi_encoder/pytorch/default/1/bi_encoder.pt"
+bi_encoder_path = "/kaggle/input/bi_encoder_new/pytorch/default/1/bi_encoder.pt"
 cross_encoder_path = "/kaggle/input/cross_encoder_new/pytorch/default/1"
 faiss_index_path = "/kaggle/input/bi_encoder_embedding/pytorch/default/1/document_index.faiss"
 corpus_df_path = "/kaggle/input/soict-dataset-2024-segmented/corpus_segmented.csv"
@@ -256,7 +256,8 @@ def format_retrieval_results(results: List[Dict[str, Union[str, float, int]]]) -
         text = text.replace('_', ' ')    # Replace underscores with spaces
 
         # Add document to list with its score
-        formatted_docs.append(f"Document (relevance score: {doc['cross_encoder_score']:.2f}):\n{text}")
+        formatted_docs.append(f"Document (relevance score: {
+                              doc['cross_encoder_score']:.2f}):\n{text}")
 
     # Join all documents with double newlines for better readability
     return "\n\n".join(formatted_docs)
