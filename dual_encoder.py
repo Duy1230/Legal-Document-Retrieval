@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformers import XLMRobertaModel, XLMRobertaTokenizer
+from transformers import XLMRobertaModel, XLMRobertaTokenizer, AutoModel, AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 from tqdm import tqdm
@@ -13,16 +13,14 @@ from sklearn.model_selection import train_test_split
 class BiEncoderConfig:
     def __init__(
         self,
-        model_name: str = "xlm-roberta-base",
         max_length: int = 256,
         batch_size: int = 32,
         learning_rate: float = 2e-5,
         num_epochs: int = 3,
         temperature: float = 0.05,
-        embedding_dim: int = 768  # Default XLM-RoBERTa hidden size,
+        embedding_dim: int = 768  
 
     ):
-        self.model_name = model_name
         self.max_length = max_length
         self.batch_size = batch_size
         self.learning_rate = learning_rate
@@ -35,14 +33,13 @@ class BiEncoder(nn.Module):
     def __init__(self, config: BiEncoderConfig):
         super().__init__()
         self.config = config
-        # Initialize two separate encoders
-        self.question_encoder = XLMRobertaModel.from_pretrained(
-            config.model_name)
-        self.document_encoder = XLMRobertaModel.from_pretrained(
-            config.model_name)
+        
+        # Load the pre-trained Vietnamese bi-encoder for both encoders
+        self.question_encoder = AutoModel.from_pretrained("bkai-foundation-models/vietnamese-bi-encoder")
+        self.document_encoder = AutoModel.from_pretrained("bkai-foundation-models/vietnamese-bi-encoder")
 
-        # Shared tokenizer (we don't need separate tokenizers)
-        self.tokenizer = XLMRobertaTokenizer.from_pretrained(config.model_name)
+        # Use the model's tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained("bkai-foundation-models/vietnamese-bi-encoder")
         self.max_length = config.max_length
 
     def get_device(self):
@@ -143,6 +140,9 @@ class BiEncoderTrainer:
         self.config = config
         self.model = BiEncoder(self.config)
         
+        # Initialize with smaller learning rate for fine-tuning
+        self.config.learning_rate = 1e-5  # Reduced from 2e-5
+        
         # Setup multi-GPU
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs!")
@@ -152,9 +152,49 @@ class BiEncoderTrainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
         
+        # Implement gradual unfreezing
+        self.unfreeze_layers = 0  # Start with all layers frozen
+        self._freeze_layers()
+        
         # metrics tracking
         self.best_mrr = 0.0
         self.best_recall = 0.0
+        
+        # Add new attributes for step-based unfreezing
+        self.total_steps = 0
+        self.unfreeze_schedule = None  # Will be set in train()
+
+    def _freeze_layers(self):
+        """Freeze/unfreeze layers gradually during training"""
+        # First freeze all layers
+        for param in self.model.question_encoder.parameters():
+            param.requires_grad = False
+        for param in self.model.document_encoder.parameters():
+            param.requires_grad = False
+            
+        def unfreeze_model_layers(model, num_layers):
+            # Always unfreeze the pooler and final layer
+            if isinstance(model, nn.DataParallel):
+                model = model.module
+            
+            # Unfreeze pooler
+            for param in model.pooler.parameters():
+                param.requires_grad = True
+            
+            # Always keep the final layer unfrozen
+            if num_layers == 0:
+                for param in model.encoder.layer[-1].parameters():
+                    param.requires_grad = True
+                return
+                
+            # Unfreeze specified number of layers from the top
+            for layer in list(model.encoder.layer)[-num_layers:]:
+                for param in layer.parameters():
+                    param.requires_grad = True
+                
+        # Apply unfreezing to both encoders
+        unfreeze_model_layers(self.model.question_encoder, self.unfreeze_layers)
+        unfreeze_model_layers(self.model.document_encoder, self.unfreeze_layers)
 
     def set_scores(self, scores: Tuple):
         self.best_mrr = scores[0]
@@ -276,35 +316,65 @@ class BiEncoderTrainer:
             shuffle=True
         )
         
-        #separate optimizers for each encoder
-        question_optimizer = torch.optim.AdamW(
-            self.model.question_encoder.parameters(),
-            lr=self.config.learning_rate
-        )
-        document_optimizer = torch.optim.AdamW(
-            self.model.document_encoder.parameters(),
-            lr=self.config.learning_rate
+        # Calculate total steps and set unfreeze schedule
+        total_steps = len(train_dataloader) * self.config.num_epochs
+        steps_per_epoch = len(train_dataloader)
+        
+        # Adjust unfreeze schedule to be more frequent within the epoch
+        self.unfreeze_schedule = {
+            steps_per_epoch // 4: 2,     # Unfreeze top 2 layers after 25% steps
+            steps_per_epoch // 2: 4,     # Unfreeze top 4 layers after 50% steps
+            3 * steps_per_epoch // 4: 6  # Unfreeze top 6 layers after 75% steps
+        }
+        
+        # Use different optimizers for frozen/unfrozen parameters
+        def get_optimizer():
+            params = []
+            for model in [self.model.question_encoder, self.model.document_encoder]:
+                params.extend([p for p in model.parameters() if p.requires_grad])
+            return torch.optim.AdamW(
+                params,
+                lr=self.config.learning_rate,
+                weight_decay=0.01
+            )
+        
+        optimizer = get_optimizer()
+        
+        # Add learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, 
+            T_max=total_steps
         )
         
-        #mine hard negatives every n epochs
-        mine_every_n_epochs = 1
+        # Adjust mining frequency to occur multiple times within epoch
+        mine_every_n_steps = steps_per_epoch // 4  # Mine 4 times per epoch
         
         for epoch in range(self.config.num_epochs):
             self.model.train()
             total_loss = 0
             progress_bar = tqdm(train_dataloader, desc=f'Epoch {epoch + 1}/{self.config.num_epochs}')
             
-            # Mine hard negatives at the start of specified epochs
             hard_negatives = None
-            if epoch > 0 and epoch % mine_every_n_epochs == 0:
-                print("Mining hard negatives...")
-                questions = train_dataset.questions
-                contexts = train_dataset.contexts
-                hard_negatives = self.mine_hard_negatives(questions, contexts)
+            current_epoch_step = 0
             
             for batch_idx, batch in enumerate(progress_bar):
-                question_optimizer.zero_grad()
-                document_optimizer.zero_grad()
+                current_epoch_step = batch_idx
+                
+                # Check if it's time to mine hard negatives
+                if current_epoch_step % mine_every_n_steps == 0:
+                    print(f"\nMining hard negatives at step {current_epoch_step}...")
+                    questions = train_dataset.questions
+                    contexts = train_dataset.contexts
+                    hard_negatives = self.mine_hard_negatives(questions, contexts)
+                
+                # Check unfreeze schedule based on current epoch step
+                if current_epoch_step in self.unfreeze_schedule:
+                    print(f"\nUnfreezing layers at step {current_epoch_step}...")
+                    self.unfreeze_layers = self.unfreeze_schedule[current_epoch_step]
+                    self._freeze_layers()
+                    optimizer = get_optimizer()  # Reinitialize optimizer with new trainable params
+                
+                optimizer.zero_grad()
                 
                 #Prepare batch data
                 processed_batch = self.prepare_batch(batch)
@@ -345,8 +415,7 @@ class BiEncoderTrainer:
                 
                 #Backward pass
                 loss.backward()
-                question_optimizer.step()
-                document_optimizer.step()
+                optimizer.step()
                 
                 total_loss += loss.item()
                 progress_bar.set_postfix({'loss': total_loss / (progress_bar.n + 1)})
@@ -376,19 +445,29 @@ class BiEncoderTrainer:
     
     def load_model(self, path: str):
         checkpoint = torch.load(path)
-        
-        # Handle loading state dict with or without DataParallel
+        print("loading 1")
         question_state_dict = checkpoint['question_encoder']
         document_state_dict = checkpoint['document_encoder']
         
-        # If using DataParallel now but the saved model wasn't
-        if isinstance(self.model.question_encoder, nn.DataParallel):
-            # Add 'module.' prefix to all keys if it doesn't exist
-            question_state_dict = {'module.' + k: v for k, v in question_state_dict.items()}
-            document_state_dict = {'module.' + k: v for k, v in document_state_dict.items()}
-        
-        self.model.question_encoder.load_state_dict(question_state_dict)
-        self.model.document_encoder.load_state_dict(document_state_dict)
+        # Load the state dictionaries
+        try:
+            print("loading 2")
+            self.model.question_encoder.load_state_dict(question_state_dict)
+            self.model.document_encoder.load_state_dict(document_state_dict)
+        except RuntimeError as e:
+            print(f"Error loading state dict: {e}")
+            print("Attempting alternative loading method...")
+            
+            # If the first attempt fails, try the opposite approach
+            if isinstance(self.model.question_encoder, nn.DataParallel):
+                question_state_dict = {k.replace('module.', ''): v for k, v in question_state_dict.items()}
+                document_state_dict = {k.replace('module.', ''): v for k, v in document_state_dict.items()}
+            else:
+                question_state_dict = {'module.' + k: v for k, v in question_state_dict.items()}
+                document_state_dict = {'module.' + k: v for k, v in document_state_dict.items()}
+            
+            self.model.question_encoder.load_state_dict(question_state_dict)
+            self.model.document_encoder.load_state_dict(document_state_dict)
 
     def mine_hard_negatives(self, questions: List[str], documents: List[str], 
                        batch_size: int = 256) -> List[str]:  # Reduced batch size
@@ -446,4 +525,4 @@ class BiEncoderTrainer:
                 del similarity, values, indices, q_chunk, d_chunk
                 torch.cuda.empty_cache()
         
-            return [documents[idx] for idx in hard_negative_indices]
+        return [documents[idx] for idx in hard_negative_indices]
