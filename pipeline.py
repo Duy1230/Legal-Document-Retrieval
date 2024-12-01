@@ -256,8 +256,7 @@ def format_retrieval_results(results: List[Dict[str, Union[str, float, int]]]) -
         text = text.replace('_', ' ')    # Replace underscores with spaces
 
         # Add document to list with its score
-        formatted_docs.append(f"Document (relevance score: {
-                              doc['cross_encoder_score']:.2f}):\n{text}")
+        formatted_docs.append(f"Document (relevance score: {doc['cross_encoder_score']:.2f}):\n{text}")
 
     # Join all documents with double newlines for better readability
     return "\n\n".join(formatted_docs)
