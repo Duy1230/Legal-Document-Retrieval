@@ -9,16 +9,15 @@ import faiss
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-
 class BiEncoderConfig:
     def __init__(
         self,
         max_length: int = 256,
-        batch_size: int = 32,
-        learning_rate: float = 2e-5,
-        num_epochs: int = 3,
+        batch_size: int = 16,
+        learning_rate: float = 1e-5,
+        num_epochs: int = 2,
         temperature: float = 0.05,
-        embedding_dim: int = 768  
+        embedding_dim: int = 768,
 
     ):
         self.max_length = max_length
@@ -28,7 +27,25 @@ class BiEncoderConfig:
         self.temperature = temperature
         self.embedding_dim = embedding_dim
 
-
+class LegalDataset(Dataset):
+    def __init__(self, questions: List[str], contexts: List[str], tokenizer, max_length: int):
+        self.questions = questions
+        self.contexts = contexts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        
+    def __len__(self):
+        return len(self.questions)
+    
+    def __getitem__(self, idx):
+        question = self.questions[idx]
+        context = self.contexts[idx]
+        
+        return {
+            'question': question,
+            'context': context
+        }
+    
 class BiEncoder(nn.Module):
     def __init__(self, config: BiEncoderConfig):
         super().__init__()
@@ -125,7 +142,6 @@ class LegalDataset(Dataset):
             'context': context
         }
     
-
 class BiEncoderTrainer:
 
     def get_config(self) -> BiEncoderConfig:
@@ -324,7 +340,8 @@ class BiEncoderTrainer:
         self.unfreeze_schedule = {
             steps_per_epoch // 4: 2,     # Unfreeze top 2 layers after 25% steps
             steps_per_epoch // 2: 4,     # Unfreeze top 4 layers after 50% steps
-            3 * steps_per_epoch // 4: 6  # Unfreeze top 6 layers after 75% steps
+            3 * steps_per_epoch // 4: 6,  # Unfreeze top 6 layers after 75% steps
+            9 * steps_per_epoch // 10: 8  # Unfreeze top 8 layers after 90% steps
         }
         
         # Use different optimizers for frozen/unfrozen parameters
@@ -347,7 +364,7 @@ class BiEncoderTrainer:
         )
         
         # Adjust mining frequency to occur multiple times within epoch
-        mine_every_n_steps = steps_per_epoch // 4  # Mine 4 times per epoch
+        mine_every_n_steps = steps_per_epoch // 2  # Mine 4 times per epoch
         
         for epoch in range(self.config.num_epochs):
             self.model.train()
@@ -361,7 +378,7 @@ class BiEncoderTrainer:
                 current_epoch_step = batch_idx
                 
                 # Check if it's time to mine hard negatives
-                if current_epoch_step % mine_every_n_steps == 0:
+                if current_epoch_step % mine_every_n_steps == 0 and current_epoch_step != 0:
                     print(f"\nMining hard negatives at step {current_epoch_step}...")
                     questions = train_dataset.questions
                     contexts = train_dataset.contexts
@@ -445,13 +462,23 @@ class BiEncoderTrainer:
     
     def load_model(self, path: str):
         checkpoint = torch.load(path)
-        print("loading 1")
+        print
         question_state_dict = checkpoint['question_encoder']
         document_state_dict = checkpoint['document_encoder']
         
+        # Remove 'module.' prefix if it exists and model is not using DataParallel
+        if not isinstance(self.model.question_encoder, nn.DataParallel):
+            print("remove module.")
+            question_state_dict = {k.replace('module.', ''): v for k, v in question_state_dict}
+            document_state_dict = {k.replace('module.', ''): v for k, v in document_state_dict}
+        # Add 'module.' prefix if model is using DataParallel but saved model wasn't
+        elif not any(k.startswith('module.') for k in question_state_dict):
+            print("add module.")
+            question_state_dict = {'module.' + k: v for k, v in question_state_dict}
+            document_state_dict = {'module.' + k: v for k, v in document_state_dict}
+        
         # Load the state dictionaries
         try:
-            print("loading 2")
             self.model.question_encoder.load_state_dict(question_state_dict)
             self.model.document_encoder.load_state_dict(document_state_dict)
         except RuntimeError as e:

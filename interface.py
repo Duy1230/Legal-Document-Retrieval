@@ -1,20 +1,37 @@
 import os
 from typing import List
 
+from pipeline import retrieval_legal_documents
 import chainlit as cl
 from langchain_openai import ChatOpenAI
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.tools import WikipediaQueryRun
-from langchain.utilities import WikipediaAPIWrapper
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.tools import tool
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.memory import ConversationBufferMemory
 from langchain.callbacks.base import BaseCallbackHandler
 
-# Set your OpenAI API key
-# os.environ["OPENAI_API_KEY"] = ""
-
 # Custom callback handler for streaming
+
+LEGAL_SYSTEM_PROMPT = """Bạn là một trợ lý pháp lý chuyên nghiệp, 
+chuyên về luật pháp Việt Nam. Nhiệm vụ của bạn là cung cấp thông tin chính xác, 
+rõ ràng và hữu ích dựa trên các văn bản pháp luật được cung cấp.
+
+Nhiệm vụ chính:
+1. CHỈ trả lời dựa trên ngữ cảnh pháp lý được cung cấp. Nếu ngữ cảnh không có đủ thông tin để trả lời câu hỏi, hãy nêu rõ giới hạn này.
+2. Sử dụng ngôn ngữ đơn giản, dễ hiểu nhưng vẫn đảm bảo tính chính xác về mặt pháp lý.
+3. Duy trì giọng điệu chuyên nghiệp, khách quan.
+
+Cấu trúc câu trả lời:
+1. Câu trả lời trực tiếp: [Trả lời ngắn gọn]
+2. Giải thích chi tiết: [Giải thích rõ ràng]
+3. Căn cứ pháp lý: [Trích dẫn các điều luật liên quan]
+4. Lưu ý thêm: [Các điểm cần lưu ý nếu có]
+Lưu ý: Bạn được cung cấp một công cụ để truy vấn tài liệu dựa trên câu hỏi của người dùng
+sẽ có 10 tài liệu được trả về nhưng thường chỉ có 1 hoặc 2 tài liệu có thông tin chính
+xác, do đó hãy xem xét cẩn thận từng tài liệu trước khi trả lời, nếu nhận thấy không
+có tài liệu nào có thể trả lời được câu hỏi của người dùng hãy bảo họ là bạn không có
+thông tin
+"""
 
 
 class StreamHandler(BaseCallbackHandler):
@@ -28,9 +45,19 @@ class StreamHandler(BaseCallbackHandler):
 @tool
 def get_secret(secret_name: str) -> str:
     """
-    Using this when user ask what is the secret number
+    Retrieve a secret from the secret manager.
     """
     return "The secret number is 42"
+
+
+@tool
+def retrieve_legal_documents(query: str) -> str:
+    """
+    Sử dụng công cụ này để truy vấn 10 tài liệu luật liên quan nhất đến câu query
+    Ví dụ cách sử dụng:
+    query: Quy định về kinh doanh như thế nào?
+    """
+    return retrieval_legal_documents(query)
 
 
 @cl.on_chat_start
@@ -40,53 +67,45 @@ async def start_chat():
     llm = ChatOpenAI(
         temperature=0.7,
         streaming=True,
-        model_name="gpt-3.5-turbo"
+        model_name="gpt-4o-mini"
     )
-
-    # Create tools
-    wiki_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
-
-    # Add the custom get_secret tool
-    tools = [wiki_tool, get_secret]
 
     # Create a conversation memory
     memory = ConversationBufferMemory(
-        return_messages=True,
         memory_key="chat_history",
+        return_messages=True,
         output_key="output"
     )
 
-    # Define the agent prompt template
+    # Create the prompt with memory
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful AI assistant with access to Wikipedia search. Use the tool to find information when needed."),
+        ("system", LEGAL_SYSTEM_PROMPT),
         MessagesPlaceholder(variable_name="chat_history"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
         ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
     ])
 
-    # Create the ReAct agent
-    agent = create_react_agent(
+    # Create the agent
+    agent = create_tool_calling_agent(
         llm=llm,
-        tools=tools,
+        tools=[get_secret, retrieval_legal_documents],
         prompt=prompt
     )
 
-    # Create the agent executor
+    # Create the agent executor with memory
     agent_executor = AgentExecutor(
         agent=agent,
-        tools=tools,
+        tools=[get_secret, retrieval_legal_documents],
         memory=memory,
         verbose=True,
-        handle_parsing_errors=True
+        return_intermediate_steps=True,
     )
 
     # Store the agent executor in the user session
     cl.user_session.set("agent", agent_executor)
 
-    # Send initial message
-    await cl.Message(
-        content="Hello! I'm an AI assistant with Wikipedia search and secret retrieval capabilities. Ask me anything!"
-    ).send()
+    await cl.Message(content="Xin chào tôi là AI tư vấn luật \
+    luật, tôi có thể giúp gì cho bạn").send()
 
 
 @cl.on_message
@@ -107,12 +126,7 @@ async def main(message: cl.Message):
         # Check if 'output' is in the chunk to handle different streaming behaviors
         if 'output' in chunk:
             await msg.stream_token(chunk["output"])
-        elif 'intermediate_steps' in chunk:
-            # Optionally handle intermediate steps if needed
-            pass
+        elif isinstance(chunk, str):
+            await msg.stream_token(chunk)
 
     await msg.update()
-
-if __name__ == "__main__":
-    # Run the Chainlit app
-    cl.run()
