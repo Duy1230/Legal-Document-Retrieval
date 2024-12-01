@@ -8,6 +8,7 @@ from sentence_transformers.cross_encoder.evaluation import CEBinaryAccuracyEvalu
 from sentence_transformers import LoggingHandler
 import logging
 import pandas as pd
+import torch
 
 
 class LoggingCallback:
