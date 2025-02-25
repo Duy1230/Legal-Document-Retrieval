@@ -3,5 +3,4 @@ This is Retrieval-Augmented Generation (RAG) system for Vietnamese legal documen
 https://www.kaggle.com/code/epsilon1234/cs431-retrieval-system
 
 Video Demo:
-https://github.com/user-attachments/assets/6047325a-320a-4c20-8ddb-f23ba090e14c
-
+https://github.com/user-attachments/assets/ce70a68f-c397-43da-b497-aae6b44777c2
